@@ -107,14 +107,6 @@ end
 
 function firstline (filename) return readfile(filename, "*l") end
 
-function files_in_directory (dir)
-   local files = {}
-   for line in assert(io.popen('ls -1 "'..dir..'" 2>/dev/null')):lines() do
-      table.insert(files, line)
-   end
-   return files
-end
-
 -- Load Lua value from string.
 function load_string (string)
    return loadstring("return "..string)()
@@ -126,7 +118,8 @@ function load_conf (file)
 end
 
 -- Store Lua representation of value in file.
-function store_conf (file, value)
+function print_object (value, stream)
+   stream = stream or io.stdout
    local indent = 0
    local function print_indent (stream)
       for i = 1, indent do stream:write(" ") end
@@ -159,10 +152,13 @@ function store_conf (file, value)
          stream:write(("%s"):format(value))
       end
    end
-   local stream = assert(io.open(file, "w"))
-   stream:write("return ")
    print_value(value, stream)
    stream:write("\n")
+end
+function store_conf (file, value)
+   local stream = assert(io.open(file, "w"))
+   stream:write("return ")
+   print_object(value, stream)
    stream:close()
 end
 
@@ -374,8 +370,13 @@ if ffi.abi("be") then
    function htons(b) return b end
 else
   -- htonl is unsigned, matching the C version and expectations.
-   function htonl(b) return tonumber(cast('uint32_t', bswap(b))) end
-   function htons(b) return rshift(bswap(b), 16) end
+  -- Wrapping the return call in parenthesis avoids the compiler to do
+  -- a tail call optimization.  In LuaJIT when the number of successive
+  -- tail calls is higher than the loop unroll threshold, the
+  -- compilation of a trace is aborted.  If the trace was long that
+  -- can result in poor performance.
+   function htonl(b) return (tonumber(cast('uint32_t', bswap(b)))) end
+   function htons(b) return (rshift(bswap(b), 16)) end
 end
 ntohl = htonl
 ntohs = htons
@@ -456,84 +457,8 @@ function root_check (message)
    end
 end
 
--- Simple token bucket for rate-limiting of events.  A token bucket is
--- created through
---
---  local tb = token_bucket_new({ rate = <rate> })
---
--- where <rate> is the maximum allowed rate in Hz, which defaults to
--- 10.  Conceptually, <rate> tokens are added to the bucket each
--- second and the bucket can hold no more than <rate> tokens but at
--- least one.
---
-
-local token_bucket = {}
-token_bucket.mt = { __index = token_bucket }
-token_bucket.default = { rate = 10 }
-function token_bucket_new (config)
-   local config = config or token_bucket.default
-   local tb = setmetatable({}, token_bucket.mt)
-   tb:rate(config.rate or token_bucket.default.rate)
-   tb._tstamp = C.get_monotonic_time()
-   return tb
-end
-
--- The rate can be set with the rate() method at any time, which fills
--- the token bucket an also returns the previous value.  If called
--- with a nil argument, returns the currently configured rate.
-function token_bucket:rate (rate)
-   if rate ~= nil then
-      local old_rate = self._rate
-      self._rate = rate
-      self._max_tokens = math.max(rate, 1)
-      self._tokens = self._max_tokens
-      return old_rate
-   end
-   return self._rate
-end
-
-function token_bucket:_update (tokens)
-   local now = C.get_monotonic_time()
-   local tokens = math.min(self._max_tokens, tokens + self._rate*(now-self._tstamp))
-   self._tstamp = now
-   return tokens
-end
-
--- The take() method tries to remove <n> tokens from the bucket.  If
--- enough tokens are available, they are subtracted from the bucket
--- and a true value is returned.  Otherwise, the bucket remains
--- unchanged and a false value is returned.  For efficiency, the
--- tokens accumulated since the last call to take() or can_take() are
--- only added if the request can not be fulfilled by the state of the
--- bucket when the method is called.
-function token_bucket:take (n)
-   local n = n or 1
-   local result = false
-   local tokens = self._tokens
-   if n > tokens then
-      tokens = self:_update(tokens)
-   end
-   if n <= tokens then
-      tokens = tokens - n
-      result = true
-   end
-   self._tokens = tokens
-   return result
-end
-
--- The can_take() method returns a true value if the bucket contains
--- at least <n> tokens, false otherwise.  The bucket is updated in a
--- layz fashion as described for the take() method.
-function token_bucket:can_take (n)
-   local n = n or 1
-   local tokens = self._tokens
-   if n <= tokens then
-      return true
-   end
-   tokens = self:_update(tokens)
-   self._tokens = tokens
-   return n <= tokens
-end
+-- Backward compatibility
+token_bucket_new = require("lib.token_bucket").new
 
 -- Simple rate-limited logging facility.  Usage:
 --
@@ -721,6 +646,7 @@ function random_bytes_from_dev_urandom (count)
    while written < count do
       written = written + assert(f:read(bytes, count-written))
    end
+   f:close()
    return bytes
 end
 
@@ -750,6 +676,23 @@ function random_data (length)
    return ffi.string(random_bytes(length), length)
 end
 
+local lower_case = "abcdefghijklmnopqrstuvwxyz"
+local upper_case = lower_case:upper()
+local extra = "0123456789_-"
+local alphabet = table.concat({lower_case, upper_case, extra})
+assert(#alphabet == 64)
+function random_printable_string (entropy)
+   -- 64 choices in our alphabet, so 6 bits of entropy per byte.
+   entropy = entropy or 160
+   local length = math.floor((entropy - 1) / 6) + 1
+   local bytes = random_data(length)
+   local out = {}
+   for i=1,length do
+      out[i] = alphabet:byte(bytes:byte(i) % 64 + 1)
+   end
+   return string.char(unpack(out))
+end
+
 -- Compiler barrier.
 -- Prevents LuaJIT from moving load/store operations over this call.
 -- Any FFI call is sufficient to achieve this, see:
@@ -777,6 +720,12 @@ function parse (arg, config)
    for k, o in pairs(config) do
       if ret[k] == nil then ret[k] = o.default end
    end
+   return ret
+end
+
+function set(...)
+   local ret = {}
+   for k, v in pairs({...}) do ret[v] = true end
    return ret
 end
 

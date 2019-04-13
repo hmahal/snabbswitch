@@ -52,6 +52,9 @@ Optional entries that may be present in the *parameters* table include:
    2.  Defaults to 0.9, for a 90% maximum occupancy ratio.
  * `min_occupancy_rate`: Minimum ratio of `occupancy/size`.  Removing an
    entry from an "empty" table will shrink the table.
+ * `resize_callback`: An optional function that is called after the
+   table has been resized.  The function is called with two arguments:
+   the ctable object and the old size. By default, no callback is used.
 
 — Function **ctable.load** *stream* *parameters*
 
@@ -84,7 +87,8 @@ then an error will be raised if *key* is *not* already in the table.
 Any other true value allows updates but does not require them.  An
 update will replace the existing entry in the table.
 
-Returns the index of the inserted entry.
+Returns a pointer to the inserted entry.  Any subsequent modification
+to the table may invalidate this pointer.
 
 — Method **:update** *key*, *value*
 
