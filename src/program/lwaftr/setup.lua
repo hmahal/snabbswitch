@@ -19,7 +19,6 @@ local ipv6_reassemble = require("apps.ipv6.reassemble")
 local ndp        = require("apps.lwaftr.ndp")
 local vlan       = require("apps.vlan.vlan")
 local pci        = require("lib.hardware.pci")
-local cltable    = require("lib.cltable")
 local ipv4       = require("lib.protocol.ipv4")
 local ipv6       = require("lib.protocol.ipv6")
 local ethernet   = require("lib.protocol.ethernet")
@@ -210,7 +209,7 @@ end
 function load_kernel_iface (c, conf, v4_nic_name, v6_nic_name)
    local RawSocket = require("apps.socket.raw").RawSocket
    local v6_iface, id, queue = lwutil.parse_instance(conf)
-   local v4_iface = queue.external_interface.dev_info
+   local v4_iface = conf.softwire_config.instance[v6_iface].external_device
    local dev_info = {rx = "rx", tx = "tx"}
 
    lwaftr_app(c, conf, v6_iface)
@@ -261,22 +260,30 @@ function config_connectx(c, name, opt, lwconfig)
    end
    local device = lwutil.parse_instance(lwconfig)
    local queues = {}
+   local queue_counters, queue_counters_max = 0, 24
    for id, queue in pairs(lwconfig.softwire_config.instance[device].queue) do
+      queue_counters = queue_counters + 2
       queues[#queues+1] = {
          id = queue_id(queue.external_interface, id),
          mac = ethernet:ntop(queue.external_interface.mac),
-         vlan = queue.external_interface.vlan_tag
+         vlan = queue.external_interface.vlan_tag,
+         enable_counters = queue_counters <= queue_counters_max
       }
       queues[#queues+1] = {
          id = queue_id(queue.internal_interface, id),
          mac = ethernet:ntop(queue.internal_interface.mac),
-         vlan = queue.internal_interface.vlan_tag
+         vlan = queue.internal_interface.vlan_tag,
+         enable_counters = queue_counters <= queue_counters_max
       }
    end
    if lwutil.is_lowest_queue(lwconfig) then
       config.app(c, "ConnectX_"..opt.pci:gsub("[%.:]", "_"), connectx.ConnectX, {
          pciaddress = opt.pci,
-         queues = queues
+         queues = queues,
+         sendq_size = 4096,
+         recvq_size = 4096,
+         fc_rx_enable = false,
+         fc_tx_enable = false
       })
    end
    config.app(c, name, connectx.IO, {
