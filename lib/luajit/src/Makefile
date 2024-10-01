@@ -7,7 +7,7 @@
 # Also works with MinGW and Cygwin on Windows.
 # Please check msvcbuild.bat for building with MSVC on Windows.
 #
-# Copyright (C) 2005-2017 Mike Pall. See Copyright Notice in luajit.h
+# Copyright (C) 2005-2023 Mike Pall. See Copyright Notice in luajit.h
 ##############################################################################
 
 MAJVER=  1
@@ -71,9 +71,6 @@ XCFLAGS=
 # default mode. Please see LJ_ARCH_NUMMODE in lj_arch.h for details.
 #XCFLAGS+= -DLUAJIT_NUMMODE=1
 #XCFLAGS+= -DLUAJIT_NUMMODE=2
-#
-# Enable GC64 mode for x64.
-#XCFLAGS+= -DLUAJIT_ENABLE_GC64
 #
 ##############################################################################
 
@@ -157,12 +154,13 @@ TARGET_SONAME= libraptorjit-$(ABIVER).so.$(MAJVER)
 TARGET_DYLIBNAME= libraptorjit-$(ABIVER).$(MAJVER).dylib
 TARGET_DYLIBPATH= $(TARGET_LIBPATH)/$(TARGET_DYLIBNAME)
 TARGET_DLLNAME= lua$(NODOTABIVER).dll
+TARGET_DLLDOTANAME= libluajit-$(ABIVER).dll.a
 TARGET_XSHLDFLAGS= -shared -fPIC -Wl,-soname,$(TARGET_SONAME)
 TARGET_DYNXLDOPTS=
 
 TARGET_LFSFLAGS= -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
 TARGET_XCFLAGS= $(TARGET_LFSFLAGS) -U_FORTIFY_SOURCE
-TARGET_XLDFLAGS=
+TARGET_XLDFLAGS= -Wl,-E
 TARGET_XLIBS= -lm
 TARGET_TCFLAGS= $(CCOPTIONS) $(TARGET_XCFLAGS) $(TARGET_FLAGS) $(TARGET_CFLAGS)
 TARGET_ACFLAGS= $(CCOPTIONS) $(TARGET_XCFLAGS) $(TARGET_FLAGS) $(TARGET_CFLAGS)
@@ -208,7 +206,7 @@ DASM= $(HOST_LUA) $(DASM_DIR)/dynasm.lua
 DASM_ARCH= x64
 DASM_DASC= vm_$(DASM_ARCH).dasc
 
-BUILDVM_O= host/buildvm.o host/buildvm_asm.o host/buildvm_peobj.o \
+BUILDVM_O= host/buildvm.o host/buildvm_asm.o \
 	   host/buildvm_lib.o host/buildvm_fold.o
 BUILDVM_T= host/buildvm
 BUILDVM_X= $(BUILDVM_T)
@@ -222,13 +220,15 @@ LJVM_BOUT= $(LJVM_S)
 LJVM_MODE= elfasm
 
 LJLIB_O= lib_base.o lib_math.o lib_bit.o lib_string.o lib_table.o \
-	 lib_io.o lib_os.o lib_package.o lib_debug.o lib_jit.o lib_ffi.o
+	 lib_io.o lib_os.o lib_package.o lib_debug.o lib_jit.o lib_ffi.o \
+	 lib_buffer.o
 LJLIB_C= $(LJLIB_O:.o=.c)
 
-LJCORE_O= lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
+LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
 	  lj_str.o lj_tab.o lj_func.o lj_udata.o lj_meta.o lj_debug.o \
-	  lj_state.o lj_dispatch.o lj_vmmath.o lj_strscan.o \
-	  lj_strfmt.o lj_strfmt_num.o lj_api.o lj_vmprofile.o \
+	  lj_prng.o lj_state.o lj_dispatch.o lj_vmmath.o \
+	  lj_strscan.o lj_strfmt.o lj_strfmt_num.o lj_serialize.o \
+	  lj_api.o lj_vmprofile.o \
 	  lj_lex.o lj_parse.o lj_bcread.o lj_bcwrite.o lj_load.o \
 	  lj_ir.o lj_opt_mem.o lj_opt_fold.o lj_opt_narrow.o \
 	  lj_opt_dce.o lj_opt_loop.o lj_opt_split.o lj_opt_sink.o \
@@ -284,6 +284,10 @@ reusevm:
 	cd reusevm; \
 	cp -r * ../
 	@echo "Copied reference VM. Ready to build."
+
+update_reusevm:
+	cp lj_bcdef.h lj_ffdef.h lj_folddef.h lj_libdef.h lj_recdef.h lj_vm.S reusevm/
+	cp host/buildvm_arch.h reusevm/host/
 
 libbc:
 	./$(LUAJIT_T) host/genlibbc.lua -o host/buildvm_libbc.h $(LJLIB_C)
@@ -384,13 +388,13 @@ $(DWARF_DWO): $(ALL_HDRGEN)
 
 $(DWARF_DWO): %.dwo: %.c
 	$(E) "CC(debug) $@"
-	$(Q)$(TARGET_CC) -g3 -fno-eliminate-unused-debug-types -gsplit-dwarf -c $<
+	$(Q)$(TARGET_CC) -g3 -gdwarf-4 -gz=none -fno-eliminate-unused-debug-types -gsplit-dwarf -c $<
 
 # Embed DWARF debug information as binary data available to raptorjit.
 lj_dwarf_dwo.o lj_dwarf_dwo_dyn.o: $(DWARF_DWO)
 	$(E) "EMBED     $@"
-	$(Q)$(LD) -r -b binary -o $@ $<
-	$(Q)$(LD) -shared -b binary -o $(@:.o=_dyn.o) $<
+	$(Q)$(LD) -r -b binary -z noexecstack -o $@ $<
+	$(Q)$(LD) -r -b binary -z noexecstack -o $(@:.o=_dyn.o) $<
 
 include Makefile.dep
 

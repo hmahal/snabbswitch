@@ -6,7 +6,7 @@
 **
 **   This is a version (aka dlmalloc) of malloc/free/realloc written by
 **   Doug Lea and released to the public domain, as explained at
-**   http://creativecommons.org/licenses/publicdomain.
+**   https://creativecommons.org/licenses/publicdomain.
 **
 **   * Version pre-2.8.4 Wed Mar 29 19:46:29 2006    (dl at gee)
 **
@@ -16,8 +16,8 @@
 ** If you want to use dlmalloc in another project, you should get
 ** the original from: ftp://gee.cs.oswego.edu/pub/misc/
 ** For thread-safe derivatives, take a look at:
-** - ptmalloc: http://www.malloc.de/
-** - nedmalloc: http://www.nedprod.com/programs/portable/nedmalloc/
+** - ptmalloc: https://www.malloc.de/
+** - nedmalloc: https://www.nedprod.com/programs/portable/nedmalloc/
 */
 
 #define lj_alloc_c
@@ -31,6 +31,7 @@
 #include "lj_def.h"
 #include "lj_arch.h"
 #include "lj_alloc.h"
+#include "lj_prng.h"
 
 #ifndef LUAJIT_USE_SYSMALLOC
 
@@ -81,15 +82,11 @@
 
 #define LJ_ALLOC_MMAP		1
 
-
 #define LJ_ALLOC_MMAP_PROBE	1
 
 #define LJ_ALLOC_MBITS		47	/* 128 TB in LJ_GC64 mode. */
 
-
-
 #define LJ_ALLOC_MREMAP		1
-
 
 
 #if   LJ_ALLOC_MMAP
@@ -113,36 +110,17 @@
 
 #define LJ_ALLOC_MMAP_PROBE_LOWER	((uintptr_t)0x4000)
 
-/* No point in a giant ifdef mess. Just try to open /dev/urandom.
-** It doesn't really matter if this fails, since we get some ASLR bits from
-** every unsuitable allocation, too. And we prefer linear allocation, anyway.
-*/
-#include <fcntl.h>
-#include <unistd.h>
-
-static uintptr_t mmap_probe_seed(void)
-{
-  uintptr_t val;
-  int fd = open("/dev/urandom", O_RDONLY);
-  if (fd != -1) {
-    int ok = ((size_t)read(fd, &val, sizeof(val)) == sizeof(val));
-    (void)close(fd);
-    if (ok) return val;
-  }
-  return 1;  /* Punt. */
-}
-
-static void *mmap_probe(size_t size)
+static void *mmap_probe(PRNGState *rs, size_t size)
 {
   /* Hint for next allocation. Doesn't need to be thread-safe. */
   static uintptr_t hint_addr = 0;
-  static uintptr_t hint_prng = 0;
   int olderr = errno;
   int retry;
   for (retry = 0; retry < LJ_ALLOC_MMAP_PROBE_MAX; retry++) {
     void *p = mmap((void *)hint_addr, size, MMAP_PROT, MMAP_FLAGS_PROBE, -1, 0);
     uintptr_t addr = (uintptr_t)p;
-    if ((addr >> LJ_ALLOC_MBITS) == 0 && addr >= LJ_ALLOC_MMAP_PROBE_LOWER) {
+    if ((addr >> LJ_ALLOC_MBITS) == 0 && addr >= LJ_ALLOC_MMAP_PROBE_LOWER &&
+	((addr + size) >> LJ_ALLOC_MBITS) == 0) {
       /* We got a suitable address. Bump the hint address. */
       hint_addr = addr + size;
       errno = olderr;
@@ -167,15 +145,8 @@ static void *mmap_probe(size_t size)
       }
     }
     /* Finally, try pseudo-random probing. */
-    if (LJ_UNLIKELY(hint_prng == 0)) {
-      hint_prng = mmap_probe_seed();
-    }
-    /* The unsuitable address we got has some ASLR PRNG bits. */
-    hint_addr ^= addr & ~((uintptr_t)(LJ_PAGESIZE-1));
-    do {  /* The PRNG itself is very weak, but see above. */
-      hint_prng = hint_prng * 1103515245 + 12345;
-      hint_addr ^= hint_prng * (uintptr_t)LJ_PAGESIZE;
-      hint_addr &= (((uintptr_t)1 << LJ_ALLOC_MBITS)-1);
+    do {
+      hint_addr = lj_prng_u64(rs) & (((uintptr_t)1<<LJ_ALLOC_MBITS)-LJ_PAGESIZE);
     } while (hint_addr < LJ_ALLOC_MMAP_PROBE_LOWER);
   }
   errno = olderr;
@@ -186,14 +157,22 @@ static void *mmap_probe(size_t size)
 
 #if LJ_ALLOC_MMAP32
 
+#if LJ_TARGET_SOLARIS
+#define LJ_ALLOC_MMAP32_START	((uintptr_t)0x1000)
+#else
 #define LJ_ALLOC_MMAP32_START	((uintptr_t)0)
+#endif
 
+#if LJ_ALLOC_MMAP_PROBE
+static void *mmap_map32(PRNGState *rs, size_t size)
+#else
 static void *mmap_map32(size_t size)
+#endif
 {
 #if LJ_ALLOC_MMAP_PROBE
   static int fallback = 0;
   if (fallback)
-    return mmap_probe(size);
+    return mmap_probe(rs, size);
 #endif
   {
     int olderr = errno;
@@ -203,7 +182,7 @@ static void *mmap_map32(size_t size)
 #if LJ_ALLOC_MMAP_PROBE
     if (ptr == MFAIL) {
       fallback = 1;
-      return mmap_probe(size);
+      return mmap_probe(rs, size);
     }
 #endif
     return ptr;
@@ -213,19 +192,23 @@ static void *mmap_map32(size_t size)
 #endif
 
 #if LJ_ALLOC_MMAP32
-#define CALL_MMAP(size)		mmap_map32(size)
-#elif LJ_ALLOC_MMAP_PROBE
-#define CALL_MMAP(size)		mmap_probe(size)
+#if LJ_ALLOC_MMAP_PROBE
+#define CALL_MMAP(prng, size)	mmap_map32(prng, size)
 #else
-static void *CALL_MMAP(size_t size)
+#define CALL_MMAP(prng, size)	mmap_map32(size)
+#endif
+#elif LJ_ALLOC_MMAP_PROBE
+#define CALL_MMAP(prng, size)	mmap_probe(prng, size)
+#else
+static void *mmap_plain(size_t size)
 {
   int olderr = errno;
   void *ptr = mmap(NULL, size, MMAP_PROT, MMAP_FLAGS, -1, 0);
   errno = olderr;
   return ptr;
 }
+#define CALL_MMAP(prng, size)	mmap_plain(size)
 #endif
-
 
 static int CALL_MUNMAP(void *ptr, size_t size)
 {
@@ -259,7 +242,7 @@ static void *CALL_MREMAP_(void *ptr, size_t osz, size_t nsz, int flags)
 #endif
 
 #ifndef DIRECT_MMAP
-#define DIRECT_MMAP(s)		CALL_MMAP(s)
+#define DIRECT_MMAP(prng, s)	CALL_MMAP(prng, s)
 #endif
 
 #ifndef CALL_MREMAP
@@ -418,6 +401,7 @@ struct malloc_state {
   mchunkptr  smallbins[(NSMALLBINS+1)*2];
   tbinptr    treebins[NTREEBINS];
   msegment   seg;
+  PRNGState  *prng;
 };
 
 typedef struct malloc_state *mstate;
@@ -471,7 +455,7 @@ static int has_segment_link(mstate m, msegmentptr ss)
   noncontiguous segments are added.
 */
 #define TOP_FOOT_SIZE\
-  (align_offset(chunk2mem(0))+pad_request(sizeof(struct malloc_segment))+MIN_CHUNK_SIZE)
+  (align_offset(TWO_SIZE_T_SIZES)+pad_request(sizeof(struct malloc_segment))+MIN_CHUNK_SIZE)
 
 /* ---------------------------- Indexing Bins ---------------------------- */
 
@@ -696,11 +680,11 @@ static int has_segment_link(mstate m, msegmentptr ss)
 
 /* -----------------------  Direct-mmapping chunks ----------------------- */
 
-static void *direct_alloc(size_t nb)
+static void *direct_alloc(mstate m, size_t nb)
 {
   size_t mmsize = mmap_align(nb + SIX_SIZE_T_SIZES + CHUNK_ALIGN_MASK);
   if (LJ_LIKELY(mmsize > nb)) {     /* Check for wrap around 0 */
-    char *mm = (char *)(DIRECT_MMAP(mmsize));
+    char *mm = (char *)(DIRECT_MMAP(m->prng, mmsize));
     if (mm != CMFAIL) {
       size_t offset = align_offset(chunk2mem(mm));
       size_t psize = mmsize - offset - DIRECT_FOOT_PAD;
@@ -712,6 +696,7 @@ static void *direct_alloc(size_t nb)
       return chunk2mem(p);
     }
   }
+  UNUSED(m);
   return NULL;
 }
 
@@ -860,7 +845,7 @@ static void *alloc_sys(mstate m, size_t nb)
 
   /* Directly map large chunks */
   if (LJ_UNLIKELY(nb >= DEFAULT_MMAP_THRESHOLD)) {
-    void *mem = direct_alloc(nb);
+    void *mem = direct_alloc(m, nb);
     if (mem != 0)
       return mem;
   }
@@ -869,7 +854,7 @@ static void *alloc_sys(mstate m, size_t nb)
     size_t req = nb + TOP_FOOT_SIZE + SIZE_T_ONE;
     size_t rsize = granularity_align(req);
     if (LJ_LIKELY(rsize > nb)) { /* Fail if wraps around zero */
-      char *mp = (char *)(CALL_MMAP(rsize));
+      char *mp = (char *)(CALL_MMAP(m->prng, rsize));
       if (mp != CMFAIL) {
 	tbase = mp;
 	tsize = rsize;
@@ -930,7 +915,7 @@ static size_t release_unused_segments(mstate m)
       mchunkptr p = align_as_chunk(base);
       size_t psize = chunksize(p);
       /* Can unmap if first chunk holds entire segment and not pinned */
-      if (!cinuse(p) && (char *)p + psize >= base + size - TOP_FOOT_SIZE) {
+      if (!cinuse(p) && (char *)p + psize == (char *)mem2chunk(sp)) {
 	tchunkptr tp = (tchunkptr)p;
 	if (p == m->dv) {
 	  m->dv = 0;
@@ -1096,12 +1081,13 @@ static void *tmalloc_small(mstate m, size_t nb)
 
 /* ----------------------------------------------------------------------- */
 
-void *lj_alloc_create(void)
+void *lj_alloc_create(PRNGState *rs)
 {
   size_t tsize = DEFAULT_GRANULARITY;
   char *tbase;
   INIT_MMAP();
-  tbase = (char *)(CALL_MMAP(tsize));
+  UNUSED(rs);
+  tbase = (char *)(CALL_MMAP(rs, tsize));
   if (tbase != CMFAIL) {
     size_t msize = pad_request(sizeof(struct malloc_state));
     mchunkptr mn;
@@ -1118,6 +1104,12 @@ void *lj_alloc_create(void)
     return m;
   }
   return NULL;
+}
+
+void lj_alloc_setprng(void *msp, PRNGState *rs)
+{
+  mstate ms = (mstate)msp;
+  ms->prng = rs;
 }
 
 void lj_alloc_destroy(void *msp)
